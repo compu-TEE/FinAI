@@ -1,12 +1,15 @@
 import os
+import time
+from typing import Literal
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
+from google.genai.errors import APIError, ServerError
 from pydantic import BaseModel
 from rag import rag_answer, retrieve_documents
-from fastapi import FastAPI, HTTPException
+from sqlalchemy.orm import Session
 from models import (
     Project,
     Requirement as DBRequirement,
@@ -16,7 +19,7 @@ from models import (
     SDLCRecommendation as DBSDLCRecommendation,
     DocumentationArtifact as DBDocumentationArtifact,
     AuditLog,
-    ConversationMessage
+    ConversationMessage,
 )
 from database import SessionLocal
 
@@ -26,17 +29,63 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+import random
+
+MODEL_POOL = [
+    os.getenv("GEMINI_MODEL") or "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-3.8-flash",
+]
+# Deduplicate while preserving order
+MODEL_POOL = list(dict.fromkeys(MODEL_POOL))
+
+
+def generate_structured(contents: str, schema):
+    last_error = None
+    for model_name in MODEL_POOL:
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config={
+                        "response_mime_type": "application/json",
+                        "response_schema": schema,
+                    },
+                )
+                return response.parsed
+            except (ServerError, APIError) as exc:
+                last_error = exc
+                code = getattr(exc, "code", None)
+                if code in (429, 500, 502, 503, 504):
+                    time.sleep(1.0 * (attempt + 1) + random.uniform(0.1, 0.6))
+                    continue
+                if code == 404:
+                    break
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Gemini API error ({code}) on {model_name}: {getattr(exc, 'message', str(exc))}",
+                ) from exc
+    raise HTTPException(
+        status_code=503,
+        detail=f"All Gemini models temporarily unavailable. Last error: {last_error}",
+    )
 
 @app.get("/")
 def root():
-    return {"message": "Backend connected successfully!"}
+    return {"message": "Backend connected successfully!", "model": os.getenv("GEMINI_MODEL") or MODEL_POOL}
+
 
 class Requirement(BaseModel):
     id: str
@@ -53,16 +102,19 @@ class Requirement(BaseModel):
     confidence_score: float | None = None
     approval_status: str = "pending"
 
+
 class RequirementState(BaseModel):
     requirements: list[Requirement] = []
     missing_information: list[str] = []
     clarification_questions: list[str] = []
+
 
 class RequirementAnalysis(BaseModel):
     response: str
     requirements: list[Requirement] = []
     missing_information: list[str] = []
     clarification_questions: list[str] = []
+
 
 class QualityIssue(BaseModel):
     type: str
@@ -77,6 +129,7 @@ class QualityAnalysis(BaseModel):
     issues: list[QualityIssue] = []
     summary: str
 
+
 class ComplianceFinding(BaseModel):
     id: int | None = None
     requirement_id: str
@@ -86,15 +139,18 @@ class ComplianceFinding(BaseModel):
     recommendation: str
     approval_status: str = "Draft"
 
+
 class SingleComplianceAnalysis(BaseModel):
     status: str
     finding: str
     evidence: list[str] = []
     recommendation: str
 
+
 class ComplianceAnalysis(BaseModel):
     findings: list[ComplianceFinding] = []
     summary: str
+
 
 class RiskFinding(BaseModel):
     id: int | None = None
@@ -105,22 +161,34 @@ class RiskFinding(BaseModel):
     mitigation: str
     approval_status: str = "Draft"
 
+
 class SingleRiskAnalysis(BaseModel):
     risk_type: str
     severity: str
     description: str
     mitigation: str
+
+
 class RiskAnalysis(BaseModel):
     findings: list[RiskFinding] = []
     summary: str
 
-class ProjectCharacteristics(BaseModel):
-    regulatory_criticality: str
-    change_frequency: str
-    risk_level: str
-    complexity: str
-    delivery_priority: str
-    requirements_clarity: str
+
+ALLOWED_SDLC_MODELS = [
+    "Waterfall",
+    "V-Model",
+    "Prototyping",
+    "Iterative/Incremental",
+    "RAD",
+    "Spiral",
+    "Agile",
+]
+
+
+class SDLCAutoOutput(BaseModel):
+    recommended_model: str
+    reasoning: str
+    key_factors: list[str] = []
 
 
 class SDLCRecommendation(BaseModel):
@@ -129,6 +197,12 @@ class SDLCRecommendation(BaseModel):
     reasoning: str
     key_factors: list[str] = []
     approval_status: str = "Draft"
+
+
+class SDLCOverrideRequest(BaseModel):
+    recommended_model: str
+    override_reason: str | None = ""
+
 
 class SDLCWorkflowStep(BaseModel):
     step: int
@@ -139,6 +213,7 @@ class SDLCWorkflowStep(BaseModel):
 class SDLCWorkflow(BaseModel):
     model: str
     workflow: list[SDLCWorkflowStep]
+
 
 class DocumentationArtifact(BaseModel):
     title: str
@@ -152,155 +227,148 @@ class DocumentationPackage(BaseModel):
     acceptance_criteria: DocumentationArtifact
     traceability: DocumentationArtifact
 
+
 class ChatMessage(BaseModel):
     role: str
     content: str
 
 
 class ChatRequest(BaseModel):
+    project_id: int | None = None
     messages: list[ChatMessage]
     requirement_state: RequirementState | None = None
+
+
+class RequirementState(BaseModel):
+    project_id: int | None = None
+    requirements: list[Requirement] = []
+    missing_information: list[str] = []
+    clarification_questions: list[str] = []
+
 
 class RAGRequest(BaseModel):
     query: str
 
-class RequirementApproval(BaseModel):
-    status: str
+
+class ApprovalUpdate(BaseModel):
+    status: Literal["Draft", "Approved", "Rejected"]
+
+class ProjectCreate(BaseModel):
+    name: str | None = None
+
+
+class ProjectRename(BaseModel):
+    name: str
+
+
+def _resolve_project(db, project_id: int | None = None, create_if_missing: bool = False) -> Project:
+    if project_id is not None:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+        return project
+
+    project = db.query(Project).order_by(Project.id.desc()).first()
+    if not project and create_if_missing:
+        project = Project(
+            name="Project #1",
+            description="Financial software requirements workspace",
+        )
+        db.add(project)
+        db.commit()
+        db.refresh(project)
+    elif not project:
+        raise HTTPException(status_code=404, detail="No active project found.")
+    return project
+
 
 SYSTEM_PROMPT = """
 You are a Requirements Engineering AI assistant for financial software projects.
-
-Your job is to act as a professional requirements analyst, not as a generic chatbot.
-
-Your primary objective is to gather complete, clear, consistent, and testable software requirements
-from stakeholders through an adaptive conversation.
-
-When the stakeholder provides a requirement:
-
-1. Identify what is already known.
-2. Identify important missing information.
-3. Ask focused clarification questions about the missing information.
-4. Do not ask questions whose answers are already available in the conversation.
-5. If a requirement is vague, ambiguous, incomplete, or contradictory, explicitly point this out and
-   ask for clarification.
-6. Do not invent business rules, technical constraints, regulations, or stakeholder decisions.
-7. Keep questions relevant to the current project.
-
-During requirements gathering, consider these areas when relevant:
-
-- Business objectives
-- Users and roles
-- Existing workflow
-- Inputs and outputs
-- Business rules
-- Exceptional conditions
-- Data collection and retention
-- Authentication and authorization
-- Financial transaction limits
-- Audit and reporting
-- Performance
-- Availability and reliability
-- Integration with existing systems
-- Security and privacy
-- Regulatory and compliance constraints
-- Project schedule and budget
-
-For financial applications, pay particular attention to:
-- Transaction security
-- Authentication and authorization
-- Auditability
-- Data protection
-- Fraud-related controls
-- Transaction limits
-- Regulatory requirements
-
-Do not overwhelm the stakeholder with a huge questionnaire.
-Ask only the most relevant questions needed to clarify the current requirement.
-
-When enough information has been gathered, summarize the requirements clearly.
-
-When writing a formal requirement, use testable language such as:
-"The system shall ..."
-
-Never claim that a regulatory requirement applies unless the relevant evidence has been provided or
-will be retrieved later by the compliance component.
-
-You are currently in the requirements-gathering stage. Do not generate a complete SRS, compliance
-mapping, risk register, or SDLC recommendation unless explicitly asked or enough requirements have
-been gathered for those tasks.
+Gather complete, clear, consistent, and testable software requirements from stakeholders.
+When writing a formal requirement, use testable language such as "The system shall ...".
+Do not invent business rules, technical constraints, regulations, or stakeholder decisions.
 """
+
 QUALITY_PROMPT = """
 You are a Software Requirements Quality Analysis Agent for financial software.
-
-Analyze the provided requirements and identify quality problems.
-
-Check for:
-
-1. Completeness
-   - Important information missing from the requirement
-   - Missing actors, inputs, outputs, rules, constraints, or expected behavior
-
-2. Ambiguity
-   - Vague or subjective wording
-   - Statements that could have multiple interpretations
-
-3. Consistency
-   - Conflicts between requirements
-   - Contradictory business rules or constraints
-
-4. Testability
-   - Requirements that cannot be objectively verified
-   - Missing measurable acceptance conditions
-
-5. Security
-   - Missing authentication, authorization, transaction protection,
-     data protection, or audit considerations where relevant
-
-6. Financial constraints
-   - Missing transaction limits, approval rules, failure handling,
-     or other important financial controls where relevant
-
-7. Traceability
-   - Requirements that lack enough information to understand their
-     source, purpose, or relationship to the business objective
-
-Rules:
-
-- Do not invent requirements.
-- Do not assume a regulation applies unless evidence has been provided.
-- Only identify issues supported by the provided requirements.
-- Give practical suggestions for improving each issue.
-- A high completeness score means that the available requirements contain
-  enough information for their current scope.
-- Return a score between 0 and 100.
-
-Conflict detection:
-
-Check the requirements for direct or obvious contradictions.
-
-Examples include:
-- Two requirements specifying different limits for the same operation.
-- One requirement requiring something that another requirement forbids.
-- Conflicting values, rules, permissions, or constraints.
-- Requirements whose stated behavior cannot both be satisfied.
-
-Only report a conflict when there is reasonable evidence of contradiction.
-Do not treat different priorities, categories, or levels of detail as conflicts.
-
-For each detected conflict:
-- Set type to "conflict".
-- Identify the affected requirement IDs.
-- Clearly explain the contradiction.
-- Suggest how the stakeholder should resolve it.
-
-Do not invent conflicts.
+Analyze the provided requirements for completeness, ambiguity, consistency (conflicts),
+testability, security, financial constraints, and traceability.
+Return a completeness score between 0 and 100 and actionable issues.
+For conflicts, set type to "conflict" and identify affected requirement IDs.
 """
 
+COMPLIANCE_PROMPT = """
+You are a Financial Software Compliance Analysis Agent.
+Analyze the provided software requirement using ONLY the provided knowledge-base evidence.
+Possible statuses: relevant, no_relevant_evidence, insufficient_evidence.
+Do not invent regulations or policies.
+"""
+
+RISK_PROMPT = """
+You are a Security and Risk Analysis Agent for financial software.
+Analyze the provided software requirement and identify realistic security, privacy,
+financial, operational, or availability risks supported by the requirement and evidence.
+Severity must be low, medium, or high.
+"""
+
+AUTO_SDLC_PROMPT = """
+You are an expert Software Development Life Cycle (SDLC) methodology advisor for financial software projects.
+
+Analyze the stakeholder conversation, extracted requirements, quality analysis, compliance findings, and risk findings to recommend exactly ONE SDLC model from these 7 options:
+1. Waterfall
+2. V-Model
+3. Prototyping
+4. Iterative/Incremental
+5. RAD
+6. Spiral
+7. Agile
+
+Evaluate regulatory criticality, requirement stability/clarity, change frequency, technical complexity, and security/compliance risks directly from the project artifacts provided below.
+
+Return a clear, grounded explanation ("reasoning") referencing the actual requirements, risks, and compliance findings, plus 3 to 5 concise "key_factors".
+"""
+
+SDLC_WORKFLOW_PROMPT = """
+You are an SDLC workflow generation agent for financial software projects.
+Generate a project-specific development workflow based on the selected SDLC model and project characteristics.
+Return ONLY valid JSON matching the requested schema.
+"""
+
+DOCUMENTATION_PROMPT = """
+You are a software documentation agent for financial software projects.
+Generate 5 artifacts from the provided requirements:
+
+1. srs: Format strictly according to the IEEE 830 / ISO/IEC/IEEE 29148 Software Requirements Specification standard using clear Markdown headings:
+   - 1. Introduction
+     - 1.1 Purpose
+     - 1.2 Scope
+     - 1.3 Definitions, Acronyms, and Abbreviations
+     - 1.4 References
+     - 1.5 Overview
+   - 2. Overall Description
+     - 2.1 Product Perspective
+     - 2.2 Product Functions
+     - 2.3 User Characteristics
+     - 2.4 Constraints
+     - 2.5 Assumptions and Dependencies
+   - 3. Specific Requirements
+     - 3.1 External Interface Requirements (User, Hardware, Software, Communications)
+     - 3.2 Functional Requirements (organized by requirement ID, description, inputs, processing, outputs)
+     - 3.3 Non-Functional Requirements (Performance, Security, Reliability, Availability, Regulatory Compliance)
+     - 3.4 Logical Database / Data Requirements
+   - 4. Appendices / Supporting Information
+
+2. user_stories ("As a <user>, I want <goal>, so that <benefit>.")
+3. use_cases (Actors, preconditions, main flow, alternate flows, postconditions)
+4. acceptance_criteria (Testable Given/When/Then or checklist acceptance criteria mapped to requirement IDs)
+5. traceability (Traceability matrix mapping each Requirement ID to User Stories, Use Cases, and Acceptance Criteria)
+
+Only use information contained in the provided requirements. Do not invent unstated features.
+"""
+
+
 def analysis_agent(requirements: list[Requirement]) -> QualityAnalysis:
-    requirements = [
-        req for req in requirements
-        if req.approval_status != "Rejected"
-    ]
+    requirements = [req for req in requirements if req.approval_status != "Rejected"]
     if not requirements:
         return QualityAnalysis(
             completeness_score=0,
@@ -310,121 +378,44 @@ def analysis_agent(requirements: list[Requirement]) -> QualityAnalysis:
                     severity="high",
                     description="No requirements have been captured yet.",
                     affected_requirement=None,
-                    suggestion="Gather and document at least one requirement."
+                    suggestion="Gather and document at least one requirement.",
                 )
             ],
-            summary="There are currently no requirements to analyze."
+            summary="There are currently no requirements to analyze.",
         )
 
     requirements_text = "\n\n".join(
-        f"""
-ID: {req.id}
-Statement: {req.statement}
-Category: {req.category}
-Priority: {req.priority}
-Risk: {req.risk_level}
-Acceptance Criteria: {req.acceptance_criteria}
-Dependencies: {req.dependencies}
-Assumptions: {req.assumptions}
-"""
+        f"ID: {req.id}\nStatement: {req.statement}\nCategory: {req.category}\nPriority: {req.priority}\nRisk: {req.risk_level}\nAcceptance Criteria: {req.acceptance_criteria}"
         for req in requirements
     )
-
-    response = client.models.generate_content(
-        model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
-        contents=QUALITY_PROMPT + "\n\nREQUIREMENTS:\n" + requirements_text,
-        config={
-            "response_mime_type": "application/json",
-            "response_schema": QualityAnalysis,
-        },
+    return generate_structured(
+        QUALITY_PROMPT + "\n\nREQUIREMENTS:\n" + requirements_text,
+        QualityAnalysis,
     )
 
-    return response.parsed
 
-COMPLIANCE_PROMPT = """
-You are a Financial Software Compliance Analysis Agent.
-
-Analyze the provided software requirement using the provided
-knowledge-base evidence.
-
-For the requirement:
-
-1. Identify relevant compliance, security, audit, privacy,
-   or financial-control considerations.
-
-2. Do not claim that a regulation or policy applies unless
-   the provided evidence supports the claim.
-
-3. Do not invent regulations or policies.
-
-4. If the evidence is insufficient, explicitly say so.
-
-5. Identify the evidence sources that support the finding.
-
-6. Provide a practical recommendation when appropriate.
-
-Possible statuses:
-- relevant
-- no_relevant_evidence
-- insufficient_evidence
-
-Return only structured output.
-"""
-
-
-def compliance_agent(
-    requirements: list[Requirement],
-) -> ComplianceAnalysis:
-
-    requirements = [
-        req for req in requirements
-        if req.approval_status != "Rejected"
-    ]
-
+def compliance_agent(requirements: list[Requirement]) -> ComplianceAnalysis:
+    requirements = [req for req in requirements if req.approval_status != "Rejected"]
     if not requirements:
         return ComplianceAnalysis(
             findings=[],
-            summary="No requirements were provided for compliance analysis."
+            summary="No requirements were provided for compliance analysis.",
         )
 
     all_findings = []
-
     for requirement in requirements:
         retrieved = retrieve_documents(requirement.statement)
-
         context = "\n\n".join(
-            f"""
-SOURCE: {item["source"]}
-CHUNK: {item["chunk_id"]}
-CONTENT:
-{item["content"]}
-"""
+            f"SOURCE: {item['source']}\nCHUNK: {item['chunk_id']}\nCONTENT:\n{item['content']}"
             for item in retrieved
         )
-
         prompt = (
             COMPLIANCE_PROMPT
-            + "\n\nREQUIREMENT:\n"
-            + f"ID: {requirement.id}\n"
-            + f"Statement: {requirement.statement}\n"
+            + f"\n\nREQUIREMENT:\nID: {requirement.id}\nStatement: {requirement.statement}"
             + "\n\nKNOWLEDGE BASE EVIDENCE:\n"
             + context
         )
-
-        response = client.models.generate_content(
-            model=os.getenv(
-                "GEMINI_MODEL",
-                "gemini-3.5-flash-lite"
-            ),
-            contents=prompt,
-            config={
-                "response_mime_type": "application/json",
-                "response_schema": SingleComplianceAnalysis,
-            },
-        )
-
-        result = response.parsed
-
+        result = generate_structured(prompt, SingleComplianceAnalysis)
         all_findings.append(
             ComplianceFinding(
                 requirement_id=requirement.id,
@@ -437,101 +428,32 @@ CONTENT:
 
     return ComplianceAnalysis(
         findings=all_findings,
-        summary="Compliance analysis was performed using the available knowledge-base evidence."
+        summary="Compliance analysis was performed using the available knowledge-base evidence.",
     )
 
-RISK_PROMPT = """
-You are a Security and Risk Analysis Agent for financial software.
 
-Analyze the provided software requirement and identify realistic
-security, privacy, financial, operational, or availability risks.
-
-Consider:
-
-- Authentication and authorization
-- Sensitive financial data
-- Fraud
-- Unauthorized transactions
-- Auditability
-- Data integrity
-- Availability
-- Failure handling
-- Access control
-- Privacy
-- Transaction limits
-
-Rules:
-
-1. Only identify risks that are supported by the requirement
-   and provided knowledge-base evidence.
-
-2. Do not invent regulations.
-
-3. Do not assume a specific attack has occurred.
-
-4. Give each risk a severity:
-   low, medium, or high.
-
-5. Provide a practical mitigation for each identified risk.
-
-6. If there are no meaningful risks supported by the available
-   information, return an empty findings list.
-
-Return structured output only.
-"""
-def risk_agent(
-    requirements: list[Requirement],
-) -> RiskAnalysis:
-
-    requirements = [
-        req for req in requirements
-        if req.approval_status != "Rejected"
-    ]
-
+def risk_agent(requirements: list[Requirement]) -> RiskAnalysis:
+    requirements = [req for req in requirements if req.approval_status != "Rejected"]
     if not requirements:
         return RiskAnalysis(
             findings=[],
-            summary="No requirements were provided for risk analysis."
+            summary="No requirements were provided for risk analysis.",
         )
 
     all_findings = []
-
     for requirement in requirements:
         retrieved = retrieve_documents(requirement.statement)
-
         context = "\n\n".join(
-            f"""
-SOURCE: {item["source"]}
-CHUNK: {item["chunk_id"]}
-CONTENT:
-{item["content"]}
-"""
+            f"SOURCE: {item['source']}\nCHUNK: {item['chunk_id']}\nCONTENT:\n{item['content']}"
             for item in retrieved
         )
-
         prompt = (
             RISK_PROMPT
-            + "\n\nREQUIREMENT:\n"
-            + f"ID: {requirement.id}\n"
-            + f"Statement: {requirement.statement}\n"
+            + f"\n\nREQUIREMENT:\nID: {requirement.id}\nStatement: {requirement.statement}"
             + "\n\nKNOWLEDGE BASE EVIDENCE:\n"
             + context
         )
-
-        response = client.models.generate_content(
-            model=os.getenv(
-                "GEMINI_MODEL",
-                "gemini-3.5-flash-lite"
-            ),
-            contents=prompt,
-            config={
-                "response_mime_type": "application/json",
-                "response_schema": SingleRiskAnalysis,
-            },
-        )
-
-        result = response.parsed
-
+        result = generate_structured(prompt, SingleRiskAnalysis)
         all_findings.append(
             RiskFinding(
                 requirement_id=requirement.id,
@@ -544,293 +466,152 @@ CONTENT:
 
     return RiskAnalysis(
         findings=all_findings,
-        summary="Risk analysis was performed using the available requirements and knowledge-base evidence."
+        summary="Risk analysis was performed using the available requirements and knowledge-base evidence.",
     )
 
-SDLC_PROMPT = """
-You are an expert Software Development Life Cycle (SDLC) methodology advisor.
-
-Based on the given project characteristics, recommend exactly ONE SDLC model.
-
-You may ONLY recommend one of these 7 models:
-
-1. Waterfall
-2. V-Model
-3. Prototyping
-4. Iterative/Incremental
-5. RAD
-6. Spiral
-7. Agile
-
-Consider these factors carefully:
-
-- Regulatory criticality
-- Change frequency
-- Risk level
-- Complexity
-- Delivery priority
-- Requirements clarity
-
-General guidance:
-
-Waterfall:
-Use when requirements are stable, clearly defined, change frequency is low,
-and a sequential development process is appropriate.
-
-V-Model:
-Use when requirements are stable but strong verification, validation,
-testing, quality assurance, and regulatory assurance are important.
-
-Prototyping:
-Use when requirements are unclear, user feedback is important,
-or stakeholders need an early working representation to clarify requirements.
-
-Iterative/Incremental:
-Use when the system can be developed and delivered in multiple increments,
-with requirements and functionality refined across iterations.
-
-RAD:
-Use when rapid development is important, requirements are reasonably understood,
-the project has relatively low risk, and quick delivery with frequent user feedback
-is desired.
-
-Spiral:
-Use when project risk and complexity are high, especially when continuous
-risk identification, analysis, prototyping, and mitigation are required.
-
-Agile:
-Use when requirements change frequently, continuous stakeholder feedback is
-important, and the project benefits from short iterative development cycles.
-
-Delivery priority:
-- Low: delivery speed is not a major constraint; prioritize completeness,
-  quality, and risk reduction.
-- Medium: balance delivery speed with engineering quality and risk.
-- High: fast delivery is important; favor approaches that support rapid
-  iteration and shorter feedback cycles.
-
-Requirements clarity:
-- Low: requirements are unclear or ambiguous; strongly consider Prototyping.
-- Medium: requirements are partially defined and may evolve; consider
-  Iterative/Incremental, Prototyping, or Agile.
-- High: requirements are well-defined and stable; consider Waterfall,
-  V-Model, RAD, or Agile depending on other factors.
-
-Do not recommend a model outside the seven listed above.
-
-Return the result in the following structure:
-
-{
-  "recommended_model": "one of the 7 models",
-  "reasoning": "clear explanation of why this model fits the project",
-  "key_factors": [
-    "factor 1",
-    "factor 2",
-    "factor 3"
-  ]
-}
-
-Project characteristics:
-
-Regulatory criticality: {regulatory_criticality}
-Change frequency: {change_frequency}
-Risk level: {risk_level}
-Complexity: {complexity}
-Delivery priority: {delivery_priority}
-Requirements clarity: {requirements_clarity}
-"""
-
-def sdlc_agent(characteristics: ProjectCharacteristics):
-    response = client.models.generate_content(
-        model=os.getenv("GEMINI_MODEL"),
-        contents=(
-            SDLC_PROMPT
-            + "\n\nProject Characteristics:\n"
-            + characteristics.model_dump_json(indent=2)
-        ),
-        config={
-            "response_mime_type": "application/json",
-            "response_schema": SDLCRecommendation,
-        },
+def _build_project_context(db, project_id: int) -> str:
+    requirements = (
+        db.query(DBRequirement)
+        .filter(
+            DBRequirement.project_id == project_id,
+            DBRequirement.approval_status != "Rejected",
+        )
+        .all()
+    )
+    messages = (
+        db.query(ConversationMessage)
+        .filter(ConversationMessage.project_id == project_id)
+        .order_by(ConversationMessage.created_at.asc())
+        .all()
+    )
+    latest_quality = (
+        db.query(DBQualityAnalysis)
+        .filter(DBQualityAnalysis.project_id == project_id)
+        .order_by(DBQualityAnalysis.id.desc())
+        .first()
+    )
+    compliance_findings = (
+        db.query(DBComplianceFinding)
+        .filter(
+            DBComplianceFinding.project_id == project_id,
+            DBComplianceFinding.approval_status != "Rejected",
+        )
+        .all()
+    )
+    risk_findings = (
+        db.query(DBRiskFinding)
+        .filter(
+            DBRiskFinding.project_id == project_id,
+            DBRiskFinding.approval_status != "Rejected",
+        )
+        .all()
     )
 
-    return response.parsed
+    if not requirements and not messages:
+        raise HTTPException(
+            status_code=400,
+            detail="Add stakeholder messages or requirements before generating an SDLC recommendation.",
+        )
 
-SDLC_WORKFLOW_PROMPT = """
-You are an SDLC workflow generation agent for financial software projects.
+    conv_text = "\n".join(f"{m.role.upper()}: {m.content}" for m in messages) or "None"
+    req_text = "\n".join(
+        f"- [{r.requirement_code}] ({r.category}, priority={r.priority}, risk={r.risk_level}): {r.statement}"
+        for r in requirements
+    ) or "None"
+    quality_text = (
+        f"Completeness: {latest_quality.completeness_score}% | Summary: {latest_quality.summary} | Issues: {len(latest_quality.issues or [])}"
+        if latest_quality
+        else "Not run yet"
+    )
+    compliance_text = "\n".join(
+        f"- [{c.requirement_code}] ({c.status}): {c.finding}" for c in compliance_findings
+    ) or "Not run yet"
+    risk_text = "\n".join(
+        f"- [{r.requirement_code}] ({r.severity} - {r.risk_type}): {r.description}"
+        for r in risk_findings
+    ) or "Not run yet"
 
-Generate a project-specific development workflow based on:
-- The selected SDLC model
-- Project characteristics
+    return (
+        f"STAKEHOLDER CONVERSATION:\n{conv_text}\n\n"
+        f"EXTRACTED REQUIREMENTS:\n{req_text}\n\n"
+        f"QUALITY ANALYSIS:\n{quality_text}\n\n"
+        f"COMPLIANCE FINDINGS:\n{compliance_text}\n\n"
+        f"RISK FINDINGS:\n{risk_text}"
+    )
 
-The workflow should include appropriate phases such as:
-requirements, analysis, architecture/design, development, testing,
-security/compliance validation, approval, deployment, and monitoring.
+def sdlc_agent(project_context: str) -> SDLCAutoOutput:
+    return generate_structured(
+        AUTO_SDLC_PROMPT + "\n\n" + project_context,
+        SDLCAutoOutput,
+    )
 
-Adapt the workflow to the selected SDLC model and project risk.
-
-Return ONLY valid JSON in this format:
-
-{
-  "model": "string",
-  "workflow": [
-    {
-      "step": 1,
-      "phase": "string",
-      "description": "string"
-    }
-  ]
-}
-
-Do not invent specific regulations or external facts.
-"""
 
 def sdlc_workflow_agent(
-    characteristics: ProjectCharacteristics,
-    recommendation: SDLCRecommendation
-):
+    project_context: str,
+    recommendation: SDLCRecommendation,
+) -> SDLCWorkflow:
     prompt = (
         SDLC_WORKFLOW_PROMPT
-        + "\n\nProject Characteristics:\n"
-        + characteristics.model_dump_json(indent=2)
-        + "\n\nSDLC Recommendation:\n"
-        + recommendation.model_dump_json(indent=2)
+        + f"\n\nSelected SDLC Model: {recommendation.recommended_model}"
+        + f"\nReasoning: {recommendation.reasoning}"
+        + f"\n\nPROJECT ARTIFACTS:\n{project_context}"
     )
+    return generate_structured(prompt, SDLCWorkflow)
 
-    response = client.models.generate_content(
-        model=os.getenv("GEMINI_MODEL"),
-        contents=prompt,
-        config={
-            "response_mime_type": "application/json",
-            "response_schema": SDLCWorkflow,
-        },
-    )
 
-    return response.parsed
-
-DOCUMENTATION_PROMPT = """
-You are a software documentation agent for financial software projects.
-
-Generate documentation from the provided validated requirements.
-
-Create the following five artifacts:
-
-1. SRS
-   - System overview
-   - Functional requirements
-   - Non-functional requirements
-   - Constraints
-
-2. User Stories
-   - Convert the requirements into clear user stories.
-   - Use the format:
-     As a <user>, I want <goal>, so that <benefit>.
-
-3. Use Cases
-   - Identify relevant actors.
-   - Describe the main interactions between actors and the system.
-
-4. Acceptance Criteria
-   - Provide testable acceptance criteria for the requirements.
-
-5. Traceability
-   - Map each requirement to the generated documentation artifacts.
-   - Use requirement IDs where available.
-
-Only use information contained in the provided requirements.
-Do not invent regulations, requirements, users, or system capabilities.
-
-Return ONLY valid JSON matching the requested schema.
-"""
-
-def documentation_agent(requirements: list[Requirement]):
+def documentation_agent(requirements: list[Requirement]) -> DocumentationPackage:
+    active_reqs = [r for r in requirements if r.approval_status != "Rejected"]
+    if not active_reqs:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one non-rejected requirement is needed to generate documentation.",
+        )
     prompt = (
         DOCUMENTATION_PROMPT
         + "\n\nValidated Requirements:\n"
-        + "\n".join(
-            req.model_dump_json(indent=2)
-            for req in requirements
-        )
+        + "\n".join(req.model_dump_json(indent=2) for req in active_reqs)
     )
+    return generate_structured(prompt, DocumentationPackage)
 
-    response = client.models.generate_content(
-        model=os.getenv("GEMINI_MODEL"),
-        contents=prompt,
-        config={
-            "response_mime_type": "application/json",
-            "response_schema": DocumentationPackage,
-        },
-    )
-
-    return response.parsed
 
 @app.post("/chat")
 def chat(request: ChatRequest):
     conversation = "\n\n".join(
-        f"{message.role.upper()}: {message.content}"
-        for message in request.messages
+        f"{m.role.upper()}: {m.content}" for m in request.messages
     )
-
-    structured_prompt = SYSTEM_PROMPT + """
-
-Analyze the stakeholder conversation and return structured requirements.
-
-Rules:
-
-- "response" is the natural-language message that should be shown to the stakeholder.
-- "requirements" contains only requirements that are sufficiently supported by the conversation.
-- "missing_information" contains important information that is still needed.
-- "clarification_questions" contains focused questions needed to gather that information.
-- Do not invent requirements, business rules, regulations, or technical decisions.
-- Do not create a requirement merely because you think it would be useful.
-- A requirement should use testable "The system shall..." language when possible.
-"""
-
-    response = client.models.generate_content(
-        model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
-        contents=structured_prompt + "\n\n" + conversation,
-        config={
-            "response_mime_type": "application/json",
-            "response_schema": RequirementAnalysis,
-        },
+    structured_prompt = (
+        SYSTEM_PROMPT
+        + '\n\nAnalyze the stakeholder conversation and return structured JSON with "response", "requirements", "missing_information", and "clarification_questions".\n\n'
+        + conversation
     )
+    parsed = generate_structured(structured_prompt, RequirementAnalysis)
+    result = parsed.model_dump()
 
-    result = response.parsed.model_dump()
-
-    # Save requirements to PostgreSQL
     db = SessionLocal()
-
     try:
-        project = (
-            db.query(Project)
-            .order_by(Project.id.desc())
-            .first()
-        )
-
+        project = _resolve_project(db, request.project_id, create_if_missing=True)
         if not project:
             project = Project(
                 name="Financial Requirements AI Project",
-                description="Automatically extracted financial software requirements"
+                description="Automatically extracted financial software requirements",
             )
             db.add(project)
             db.commit()
             db.refresh(project)
 
-        # Save conversation messages
         db.query(ConversationMessage).filter(
             ConversationMessage.project_id == project.id
         ).delete()
 
-        for message in request.messages:
+        for msg in request.messages:
             db.add(
                 ConversationMessage(
                     project_id=project.id,
-                    role=message.role,
-                    content=message.content,
+                    role=msg.role,
+                    content=msg.content,
                 )
             )
 
-        # Save the newly generated AI response
         db.add(
             ConversationMessage(
                 project_id=project.id,
@@ -856,100 +637,80 @@ Rules:
                 confidence_score=req.get("confidence_score"),
                 approval_status=req.get("approval_status", "pending"),
             )
-
             db.add(requirement)
             db.flush()
             req["db_id"] = requirement.id
 
         db.commit()
-
     except Exception:
         db.rollback()
         raise
-
     finally:
         db.close()
 
     return result
 
+
 @app.post("/analyze")
 def analyze_requirements(request: RequirementState):
     analysis = analysis_agent(request.requirements)
-
     db = SessionLocal()
-
     try:
-        project = (
-    db.query(Project)
-    .order_by(Project.id.desc())
-    .first()
-)
-
+        project = _resolve_project(db, request.project_id, create_if_missing=True)
         if not project:
             project = Project(
                 name="Financial Requirements AI Project",
-                description="Automatically extracted financial software requirements"
+                description="Automatically extracted financial software requirements",
             )
             db.add(project)
             db.commit()
             db.refresh(project)
 
-        quality_record = DBQualityAnalysis(
-            project_id=project.id,
-            completeness_score=analysis.completeness_score,
-            summary=analysis.summary,
-            issues=[
-                issue.model_dump()
-                for issue in analysis.issues
-            ],
+        db.add(
+            DBQualityAnalysis(
+                project_id=project.id,
+                completeness_score=analysis.completeness_score,
+                summary=analysis.summary,
+                issues=[issue.model_dump() for issue in analysis.issues],
+            )
         )
-
-        db.add(quality_record)
         db.commit()
-
     except Exception:
         db.rollback()
         raise
-
     finally:
         db.close()
 
     return analysis.model_dump()
 
+
 @app.post("/rag")
 def rag(request: RAGRequest):
     result = rag_answer(request.query)
-
     return {
         "query": request.query,
         "answer": result["answer"],
         "sources": result["sources"],
     }
 
+
 @app.post("/compliance")
 def analyze_compliance(request: RequirementState):
     analysis = compliance_agent(request.requirements)
-
     db = SessionLocal()
-
     try:
-        project = (
-    db.query(Project)
-    .order_by(Project.id.desc())
-    .first()
-)
-
+        project = _resolve_project(db, request.project_id, create_if_missing=True)
         if not project:
             project = Project(
                 name="Financial Requirements AI Project",
-                description="Automatically extracted financial software requirements"
+                description="Automatically extracted financial software requirements",
             )
             db.add(project)
             db.commit()
             db.refresh(project)
 
         for finding in analysis.findings:
-            compliance_record = DBComplianceFinding(
+            record = DBComplianceFinding(
                 project_id=project.id,
                 requirement_code=finding.requirement_id,
                 status=finding.status,
@@ -957,48 +718,38 @@ def analyze_compliance(request: RequirementState):
                 evidence=finding.evidence,
                 recommendation=finding.recommendation,
             )
-
-            db.add(compliance_record)
+            db.add(record)
             db.flush()
-
-            finding.id = compliance_record.id
-            finding.approval_status = compliance_record.approval_status
+            finding.id = record.id
+            finding.approval_status = record.approval_status
 
         db.commit()
-
     except Exception:
         db.rollback()
         raise
-
     finally:
         db.close()
 
     return analysis.model_dump()
 
+
 @app.post("/risk")
 def analyze_risk(request: RequirementState):
     analysis = risk_agent(request.requirements)
-
     db = SessionLocal()
-
     try:
-        project = (
-    db.query(Project)
-    .order_by(Project.id.desc())
-    .first()
-)
-
+        project = _resolve_project(db, request.project_id, create_if_missing=True)
         if not project:
             project = Project(
                 name="Financial Requirements AI Project",
-                description="Automatically extracted financial software requirements"
+                description="Automatically extracted financial software requirements",
             )
             db.add(project)
             db.commit()
             db.refresh(project)
 
         for finding in analysis.findings:
-            risk_record = DBRiskFinding(
+            record = DBRiskFinding(
                 project_id=project.id,
                 requirement_code=finding.requirement_id,
                 risk_type=finding.risk_type,
@@ -1006,167 +757,143 @@ def analyze_risk(request: RequirementState):
                 description=finding.description,
                 mitigation=finding.mitigation,
             )
-
-            db.add(risk_record)
+            db.add(record)
             db.flush()
-
-            finding.id = risk_record.id
-            finding.approval_status = risk_record.approval_status
+            finding.id = record.id
+            finding.approval_status = record.approval_status
 
         db.commit()
-
     except Exception:
         db.rollback()
         raise
-
     finally:
         db.close()
 
     return analysis.model_dump()
 
-class RiskApproval(BaseModel):
-    status: str
-
 
 @app.patch("/risk/{finding_id}/approval")
-def update_risk_approval(
-    finding_id: int,
-    approval: RiskApproval
-):
-    if approval.status not in ["Draft", "Approved", "Rejected"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid approval status"
-        )
-
+def update_risk_approval(finding_id: int, approval: ApprovalUpdate):
     db = SessionLocal()
-
     try:
-        finding = (
-            db.query(DBRiskFinding)
-            .filter(DBRiskFinding.id == finding_id)
-            .first()
-        )
-
+        finding = db.query(DBRiskFinding).filter(DBRiskFinding.id == finding_id).first()
         if not finding:
-            raise HTTPException(
-                status_code=404,
-                detail="Risk finding not found"
-            )
-
+            raise HTTPException(status_code=404, detail="Risk finding not found")
         old_status = finding.approval_status
-
         finding.approval_status = approval.status
-
-        audit = AuditLog(
-            entity_type="Risk",
-            entity_id=finding.id,
-            action="Approval Status Changed",
-            old_status=old_status,
-            new_status=approval.status
+        db.add(
+            AuditLog(
+                entity_type="Risk",
+                entity_id=finding.id,
+                action="Approval Status Changed",
+                old_status=old_status,
+                new_status=approval.status,
+            )
         )
-
-        db.add(audit)
         db.commit()
         db.refresh(finding)
-
         return {
             "message": "Risk approval status updated",
             "finding_id": finding.id,
             "requirement_code": finding.requirement_code,
-            "approval_status": finding.approval_status
+            "approval_status": finding.approval_status,
         }
-
     finally:
         db.close()
 
+
 @app.post("/sdlc", response_model=SDLCRecommendation)
-def recommend_sdlc(characteristics: ProjectCharacteristics):
-
-    recommendation = sdlc_agent(characteristics)
-
+def recommend_sdlc():
+    project_id: int | None = None
     db = SessionLocal()
-
     try:
-        project = (
-    db.query(Project)
-    .order_by(Project.id.desc())
-    .first()
-)
-
+        project = _resolve_project(db, project_id, create_if_missing=(project_id is None))
         if not project:
-            project = Project(
-                name="Financial Requirements AI Project",
-                description="Automatically extracted financial software requirements"
-            )
-            db.add(project)
-            db.commit()
-            db.refresh(project)
+            raise HTTPException(status_code=404, detail="No active project found.")
+
+        context = _build_project_context(db, project.id)
+        auto_result = sdlc_agent(context)
 
         sdlc_record = DBSDLCRecommendation(
             project_id=project.id,
-            regulatory_criticality=characteristics.regulatory_criticality,
-            change_frequency=characteristics.change_frequency,
-            risk_level=characteristics.risk_level,
-            complexity=characteristics.complexity,
-            delivery_priority=characteristics.delivery_priority,
-            requirements_clarity=characteristics.requirements_clarity,
-            recommended_model=recommendation.recommended_model,
-            reasoning=recommendation.reasoning,
-            key_factors=recommendation.key_factors,
+            regulatory_criticality="auto",
+            change_frequency="auto",
+            risk_level="auto",
+            complexity="auto",
+            delivery_priority="auto",
+            requirements_clarity="auto",
+            recommended_model=auto_result.recommended_model,
+            reasoning=auto_result.reasoning,
+            key_factors=auto_result.key_factors,
         )
-
         db.add(sdlc_record)
         db.flush()
 
-        recommendation = SDLCRecommendation(
+        response = SDLCRecommendation(
             id=sdlc_record.id,
-            recommended_model=recommendation.recommended_model,
-            reasoning=recommendation.reasoning,
-            key_factors=recommendation.key_factors,
-            approval_status=sdlc_record.approval_status,
+            recommended_model=sdlc_record.recommended_model,
+            reasoning=sdlc_record.reasoning,
+            key_factors=sdlc_record.key_factors,
+            approval_status=sdlc_record.approval_status or "Draft",
         )
-
         db.commit()
-
+        return response
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception:
         db.rollback()
         raise
-
     finally:
         db.close()
 
-    return recommendation
 
 @app.post("/sdlc/workflow", response_model=SDLCWorkflow)
-def generate_sdlc_workflow(
-    characteristics: ProjectCharacteristics
-):
-    recommendation = sdlc_agent(characteristics)
+def generate_sdlc_workflow():
+    project_id: int | None = None
+    db = SessionLocal()
+    try:
+        project = _resolve_project(db, project_id, create_if_missing=(project_id is None))
+        if not project:
+            raise HTTPException(status_code=404, detail="No active project found.")
 
-    return sdlc_workflow_agent(
-        characteristics,
-        recommendation
-    )
+        latest_sdlc = (
+            db.query(DBSDLCRecommendation)
+            .filter(DBSDLCRecommendation.project_id == project.id)
+            .order_by(DBSDLCRecommendation.id.desc())
+            .first()
+        )
+        if not latest_sdlc:
+            raise HTTPException(
+                status_code=400,
+                detail="Generate an SDLC recommendation before generating a workflow.",
+            )
+
+        context = _build_project_context(db, project.id)
+        rec = SDLCRecommendation(
+            id=latest_sdlc.id,
+            recommended_model=latest_sdlc.recommended_model,
+            reasoning=latest_sdlc.reasoning,
+            key_factors=latest_sdlc.key_factors or [],
+            approval_status=latest_sdlc.approval_status or "Draft",
+        )
+        return sdlc_workflow_agent(context, rec)
+    finally:
+        db.close()
+
 
 @app.post("/documentation", response_model=DocumentationPackage)
 def generate_documentation(requirements: list[Requirement]):
-
+    requirements: list[Requirement]
+    project_id: int | None = None
     documentation = documentation_agent(requirements)
-
     db = SessionLocal()
-
     try:
-        project = (
-    db.query(Project)
-    .order_by(Project.id.desc())
-    .first()
-)
-
+        project = _resolve_project(db, project_id, create_if_missing=(project_id is None))
         if not project:
             project = Project(
                 name="Financial Requirements AI Project",
-                description="Automatically extracted financial software requirements"
+                description="Automatically extracted financial software requirements",
             )
             db.add(project)
             db.commit()
@@ -1179,7 +906,6 @@ def generate_documentation(requirements: list[Requirement]):
             documentation.acceptance_criteria,
             documentation.traceability,
         ]
-
         artifact_types = [
             "SRS",
             "User Stories",
@@ -1187,524 +913,380 @@ def generate_documentation(requirements: list[Requirement]):
             "Acceptance Criteria",
             "Traceability",
         ]
-
         for artifact_type, artifact in zip(artifact_types, artifacts):
-
-            record = DBDocumentationArtifact(
-                project_id=project.id,
-                artifact_type=artifact_type,
-                title=artifact.title,
-                content=artifact.content,
+            db.add(
+                DBDocumentationArtifact(
+                    project_id=project.id,
+                    artifact_type=artifact_type,
+                    title=artifact.title,
+                    content=artifact.content,
+                )
             )
-
-            db.add(record)
-
         db.commit()
-
     except Exception:
         db.rollback()
         raise
-
     finally:
         db.close()
 
     return documentation
 
-@app.post("/project/new")
-def create_new_project():
-
+def get_db():
     db = SessionLocal()
-
     try:
-        project = Project(
-            name="Financial Requirements AI Project",
-            description="Automatically extracted financial software requirements"
-        )
-
-        db.add(project)
-        db.commit()
-        db.refresh(project)
-
-        return {
-            "id": project.id,
-            "name": project.name,
-            "description": project.description
-        }
-
-    except Exception:
-        db.rollback()
-        raise
-
+        yield db
     finally:
         db.close()
+
+class ProjectCreate(BaseModel):
+    name: str | None = None
+
+@app.post("/project/new")
+def create_new_project(
+    payload: ProjectCreate | None = None,
+    db: Session = Depends(get_db),
+):
+    custom_name = (payload.name or "").strip() if payload else ""
+    if not custom_name:
+        count = db.query(Project).count() + 1
+        custom_name = f"Project #{count}"
+
+    new_project = Project(name=custom_name)
+    db.add(new_project)
+    db.commit()
+    db.refresh(new_project)
+    return {
+        "id": new_project.id,
+        "name": new_project.name,
+        "created_at": new_project.created_at,
+    }
+
+
+def _serialize_project(db, project: Project):
+    requirements = (
+        db.query(DBRequirement).filter(DBRequirement.project_id == project.id).all()
+    )
+    quality_analysis = (
+        db.query(DBQualityAnalysis)
+        .filter(DBQualityAnalysis.project_id == project.id)
+        .all()
+    )
+    compliance_findings = (
+        db.query(DBComplianceFinding)
+        .filter(DBComplianceFinding.project_id == project.id)
+        .all()
+    )
+    risk_findings = (
+        db.query(DBRiskFinding).filter(DBRiskFinding.project_id == project.id).all()
+    )
+    sdlc_recommendations = (
+        db.query(DBSDLCRecommendation)
+        .filter(DBSDLCRecommendation.project_id == project.id)
+        .all()
+    )
+    documentation_artifacts = (
+        db.query(DBDocumentationArtifact)
+        .filter(DBDocumentationArtifact.project_id == project.id)
+        .all()
+    )
+    messages = (
+        db.query(ConversationMessage)
+        .filter(ConversationMessage.project_id == project.id)
+        .order_by(ConversationMessage.created_at.asc())
+        .all()
+    )
+
+    return {
+        "project": {
+            "id": project.id,
+            "name": project.name,
+            "description": project.description,
+        },
+        "requirements": [
+            {
+                "id": req.id,
+                "requirement_code": req.requirement_code,
+                "statement": req.statement,
+                "category": req.category,
+                "source_stakeholder": req.source_stakeholder,
+                "business_justification": req.business_justification,
+                "priority": req.priority,
+                "dependencies": req.dependencies,
+                "assumptions": req.assumptions,
+                "acceptance_criteria": req.acceptance_criteria,
+                "applicable_regulations": req.applicable_regulations,
+                "risk_level": req.risk_level,
+                "confidence_score": req.confidence_score,
+                "approval_status": req.approval_status,
+            }
+            for req in requirements
+        ],
+        "quality_analysis": [
+            {
+                "id": qa.id,
+                "completeness_score": qa.completeness_score,
+                "summary": qa.summary,
+                "issues": qa.issues,
+            }
+            for qa in quality_analysis
+        ],
+        "compliance_findings": [
+            {
+                "id": f.id,
+                "requirement_code": f.requirement_code,
+                "status": f.status,
+                "finding": f.finding,
+                "evidence": f.evidence,
+                "recommendation": f.recommendation,
+                "approval_status": f.approval_status,
+            }
+            for f in compliance_findings
+        ],
+        "risk_findings": [
+            {
+                "id": f.id,
+                "requirement_code": f.requirement_code,
+                "risk_type": f.risk_type,
+                "severity": f.severity,
+                "description": f.description,
+                "mitigation": f.mitigation,
+                "approval_status": f.approval_status,
+            }
+            for f in risk_findings
+        ],
+        "sdlc_recommendations": [
+            {
+                "id": r.id,
+                "regulatory_criticality": r.regulatory_criticality,
+                "change_frequency": r.change_frequency,
+                "risk_level": r.risk_level,
+                "complexity": r.complexity,
+                "delivery_priority": r.delivery_priority,
+                "requirements_clarity": r.requirements_clarity,
+                "recommended_model": r.recommended_model,
+                "reasoning": r.reasoning,
+                "key_factors": r.key_factors,
+                "approval_status": r.approval_status,
+            }
+            for r in sdlc_recommendations
+        ],
+        "documentation_artifacts": [
+            {
+                "id": a.id,
+                "artifact_type": a.artifact_type,
+                "title": a.title,
+                "content": a.content,
+            }
+            for a in documentation_artifacts
+        ],
+        "messages": [{"role": m.role, "content": m.content} for m in messages],
+    }
+
 
 @app.get("/project")
 def get_project():
-
     db = SessionLocal()
-
     try:
-        project = (
-            db.query(Project)
-            .order_by(Project.id.desc())
-            .first()
-        )
-
+        project = db.query(Project).order_by(Project.id.desc()).first()
         if not project:
             return {"message": "No project found"}
-
-        requirements = db.query(DBRequirement).filter(
-            DBRequirement.project_id == project.id
-        ).all()
-
-        quality_analysis = db.query(DBQualityAnalysis).filter(
-            DBQualityAnalysis.project_id == project.id
-        ).all()
-
-        compliance_findings = db.query(DBComplianceFinding).filter(
-            DBComplianceFinding.project_id == project.id
-        ).all()
-
-        risk_findings = db.query(DBRiskFinding).filter(
-            DBRiskFinding.project_id == project.id
-        ).all()
-
-        sdlc_recommendations = db.query(DBSDLCRecommendation).filter(
-            DBSDLCRecommendation.project_id == project.id
-        ).all()
-
-        documentation_artifacts = db.query(DBDocumentationArtifact).filter(
-            DBDocumentationArtifact.project_id == project.id
-        ).all()
-
-        messages = db.query(ConversationMessage).filter(
-            ConversationMessage.project_id == project.id
-        ).order_by(
-            ConversationMessage.created_at.asc()
-        ).all()
-
-        return {
-            "project": {
-                "id": project.id,
-                "name": project.name,
-                "description": project.description,
-            },
-
-            "requirements": [
-                {
-                    "id": req.id,
-                    "requirement_code": req.requirement_code,
-                    "statement": req.statement,
-                    "category": req.category,
-                    "source_stakeholder": req.source_stakeholder,
-                    "business_justification": req.business_justification,
-                    "priority": req.priority,
-                    "dependencies": req.dependencies,
-                    "assumptions": req.assumptions,
-                    "acceptance_criteria": req.acceptance_criteria,
-                    "applicable_regulations": req.applicable_regulations,
-                    "risk_level": req.risk_level,
-                    "confidence_score": req.confidence_score,
-                    "approval_status": req.approval_status,
-                }
-                for req in requirements
-            ],
-
-            "quality_analysis": [
-                {
-                    "id": qa.id,
-                    "completeness_score": qa.completeness_score,
-                    "summary": qa.summary,
-                    "issues": qa.issues,
-                }
-                for qa in quality_analysis
-            ],
-
-            "compliance_findings": [
-                {
-                    "id": finding.id,
-                    "requirement_code": finding.requirement_code,
-                    "status": finding.status,
-                    "finding": finding.finding,
-                    "evidence": finding.evidence,
-                    "recommendation": finding.recommendation,
-                }
-                for finding in compliance_findings
-            ],
-
-            "risk_findings": [
-                {
-                    "id": finding.id,
-                    "requirement_code": finding.requirement_code,
-                    "risk_type": finding.risk_type,
-                    "severity": finding.severity,
-                    "description": finding.description,
-                    "mitigation": finding.mitigation,
-                }
-                for finding in risk_findings
-            ],
-
-            "sdlc_recommendations": [
-                {
-                    "id": recommendation.id,
-                    "regulatory_criticality": recommendation.regulatory_criticality,
-                    "change_frequency": recommendation.change_frequency,
-                    "risk_level": recommendation.risk_level,
-                    "complexity": recommendation.complexity,
-                    "delivery_priority": recommendation.delivery_priority,
-                    "requirements_clarity": recommendation.requirements_clarity,
-                    "recommended_model": recommendation.recommended_model,
-                    "reasoning": recommendation.reasoning,
-                    "key_factors": recommendation.key_factors,
-                }
-                for recommendation in sdlc_recommendations
-            ],
-
-            "documentation_artifacts": [
-                {
-                    "id": artifact.id,
-                    "artifact_type": artifact.artifact_type,
-                    "title": artifact.title,
-                    "content": artifact.content,
-                }
-                for artifact in documentation_artifacts
-            ],
-
-            "messages": [
-                {
-                    "role": message.role,
-                    "content": message.content,
-                }
-                for message in messages
-            ],
-        }
-
+        return _serialize_project(db, project)
     finally:
         db.close()
 
-@app.patch("/requirements/{requirement_id}/approval")
-def update_requirement_approval(
-    requirement_id: int,
-    approval: RequirementApproval
+@app.post("/project/new")
+def create_new_project(
+    payload: ProjectCreate | None = None,
+    db: Session = Depends(get_db),
 ):
-        if approval.status not in ["Draft", "Approved", "Rejected"]:
-            raise HTTPException(
-                status_code=400,
-                detail="Status must be Draft, Approved, or Rejected"
-            )
+    custom_name = (payload.name or "").strip() if payload else ""
+    if not custom_name:
+        count = db.query(Project).count() + 1
+        custom_name = f"Project #{count}"
 
-        db = SessionLocal()
+    new_project = Project(name=custom_name)
+    db.add(new_project)
+    db.commit()
+    db.refresh(new_project)
+    return {
+        "id": new_project.id,
+        "name": new_project.name,
+        "created_at": new_project.created_at,
+    }
 
-        try:
-            requirement = db.query(DBRequirement).filter(
-                DBRequirement.id == requirement_id
-            ).first()
 
-            if not requirement:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Requirement not found"
-                )
+@app.patch("/projects/{project_id}")
+def rename_project(project_id: int, payload: ProjectRename):
+    clean_name = payload.name.strip()
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="Project name cannot be empty")
+    db = SessionLocal()
+    try:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        project.name = clean_name
+        db.commit()
+        db.refresh(project)
+        return {"id": project.id, "name": project.name, "description": project.description}
+    finally:
+        db.close()
 
-            old_status = requirement.approval_status
 
-            requirement.approval_status = approval.status
-
-            audit = AuditLog(
+@app.patch("/requirements/{requirement_id}/approval")
+def update_requirement_approval(requirement_id: int, approval: ApprovalUpdate):
+    db = SessionLocal()
+    try:
+        requirement = (
+            db.query(DBRequirement).filter(DBRequirement.id == requirement_id).first()
+        )
+        if not requirement:
+            raise HTTPException(status_code=404, detail="Requirement not found")
+        old_status = requirement.approval_status
+        requirement.approval_status = approval.status
+        db.add(
+            AuditLog(
                 entity_type="Requirement",
                 entity_id=requirement.id,
                 action="Approval Status Changed",
                 old_status=old_status,
-                new_status=approval.status
+                new_status=approval.status,
             )
-
-            db.add(audit)
-            db.commit()
-            db.refresh(requirement)
-
-            return {
-                "message": "Requirement approval status updated",
-                "requirement_id": requirement.id,
-                "requirement_code": requirement.requirement_code,
-                "approval_status": requirement.approval_status
-            }
-
-        except HTTPException:
-            raise
-
-        except Exception:
-            db.rollback()
-            raise
-
-        finally:
-            db.close()
-
-class ComplianceApproval(BaseModel):
-    status: str
+        )
+        db.commit()
+        db.refresh(requirement)
+        return {
+            "message": "Requirement approval status updated",
+            "requirement_id": requirement.id,
+            "requirement_code": requirement.requirement_code,
+            "approval_status": requirement.approval_status,
+        }
+    finally:
+        db.close()
 
 
 @app.patch("/compliance/{finding_id}/approval")
-def update_compliance_approval(
-    finding_id: int,
-    approval: ComplianceApproval
-):
-    if approval.status not in ["Draft", "Approved", "Rejected"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid approval status"
-        )
-
+def update_compliance_approval(finding_id: int, approval: ApprovalUpdate):
     db = SessionLocal()
-
     try:
         finding = (
             db.query(DBComplianceFinding)
             .filter(DBComplianceFinding.id == finding_id)
             .first()
         )
-
         if not finding:
-            raise HTTPException(
-                status_code=404,
-                detail="Compliance finding not found"
-            )
-
+            raise HTTPException(status_code=404, detail="Compliance finding not found")
         old_status = finding.approval_status
-
         finding.approval_status = approval.status
-
-        audit = AuditLog(
-            entity_type="Compliance",
-            entity_id=finding.id,
-            action="Approval Status Changed",
-            old_status=old_status,
-            new_status=approval.status
+        db.add(
+            AuditLog(
+                entity_type="Compliance",
+                entity_id=finding.id,
+                action="Approval Status Changed",
+                old_status=old_status,
+                new_status=approval.status,
+            )
         )
-
-        db.add(audit)
         db.commit()
         db.refresh(finding)
-
         return {
             "message": "Compliance approval status updated",
             "finding_id": finding.id,
             "requirement_code": finding.requirement_code,
-            "approval_status": finding.approval_status
+            "approval_status": finding.approval_status,
         }
-
     finally:
         db.close()
 
-class SDLCApproval(BaseModel):
-    status: str
-
 
 @app.patch("/sdlc/{recommendation_id}/approval")
-def update_sdlc_approval(
-    recommendation_id: int,
-    approval: SDLCApproval
-):
-    if approval.status not in ["Draft", "Approved", "Rejected"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid approval status"
-        )
-
+def update_sdlc_approval(recommendation_id: int, approval: ApprovalUpdate):
     db = SessionLocal()
-
     try:
         recommendation = (
             db.query(DBSDLCRecommendation)
             .filter(DBSDLCRecommendation.id == recommendation_id)
             .first()
         )
-
         if not recommendation:
-            raise HTTPException(
-                status_code=404,
-                detail="SDLC recommendation not found"
-            )
-
+            raise HTTPException(status_code=404, detail="SDLC recommendation not found")
         old_status = recommendation.approval_status
-
         recommendation.approval_status = approval.status
-
-        audit = AuditLog(
-            entity_type="SDLC",
-            entity_id=recommendation.id,
-            action="Approval Status Changed",
-            old_status=old_status,
-            new_status=approval.status
+        db.add(
+            AuditLog(
+                entity_type="SDLC",
+                entity_id=recommendation.id,
+                action="Approval Status Changed",
+                old_status=old_status,
+                new_status=approval.status,
+            )
         )
-
-        db.add(audit)
         db.commit()
         db.refresh(recommendation)
-
         return {
             "message": "SDLC approval status updated",
             "recommendation_id": recommendation.id,
             "recommended_model": recommendation.recommended_model,
-            "approval_status": recommendation.approval_status
+            "approval_status": recommendation.approval_status,
         }
-
     finally:
         db.close()
+
+@app.patch("/sdlc/{recommendation_id}/override")
+def override_sdlc_recommendation(recommendation_id: int, payload: SDLCOverrideRequest):
+    from models import SDLCRecommendation as SDLCRecommendationORM
+
+    db = SessionLocal()
+    try:
+        rec = (
+            db.query(SDLCRecommendationORM)
+            .filter(SDLCRecommendationORM.id == recommendation_id)
+            .first()
+        )
+        if not rec:
+            raise HTTPException(status_code=404, detail="SDLC recommendation not found")
+
+        rec.recommended_model = payload.recommended_model.strip()
+        if payload.override_reason and payload.override_reason.strip():
+            rec.reasoning = (
+                f"[Human Override] {payload.override_reason.strip()}\n\n"
+                f"Previous AI Analysis: {rec.reasoning}"
+            )
+        rec.approval_status = "Approved"
+        db.commit()
+        db.refresh(rec)
+
+        return {
+            "id": rec.id,
+            "recommended_model": rec.recommended_model,
+            "reasoning": rec.reasoning,
+            "key_factors": rec.key_factors or [],
+            "approval_status": rec.approval_status,
+        }
+    finally:
+        db.close()
+
 
 @app.get("/projects")
 def get_projects():
     db = SessionLocal()
     try:
         projects = db.query(Project).order_by(Project.id.desc()).all()
-
         return [
-            {
-                "id": project.id,
-                "name": project.name,
-                "description": project.description,
-            }
-            for project in projects
+            {"id": p.id, "name": p.name, "description": p.description}
+            for p in projects
         ]
     finally:
         db.close()
 
+
 @app.get("/projects/{project_id}")
 def get_project_by_id(project_id: int):
     db = SessionLocal()
-
     try:
-        project = db.query(Project).filter(
-            Project.id == project_id
-        ).first()
-
+        project = db.query(Project).filter(Project.id == project_id).first()
         if not project:
-            return {"message": "Project not found"}
-
-        requirements = db.query(DBRequirement).filter(
-            DBRequirement.project_id == project.id
-        ).all()
-
-        quality_analysis = db.query(DBQualityAnalysis).filter(
-            DBQualityAnalysis.project_id == project.id
-        ).all()
-
-        compliance_findings = db.query(DBComplianceFinding).filter(
-            DBComplianceFinding.project_id == project.id
-        ).all()
-
-        risk_findings = db.query(DBRiskFinding).filter(
-            DBRiskFinding.project_id == project.id
-        ).all()
-
-        sdlc_recommendations = db.query(DBSDLCRecommendation).filter(
-            DBSDLCRecommendation.project_id == project.id
-        ).all()
-
-        documentation_artifacts = db.query(DBDocumentationArtifact).filter(
-            DBDocumentationArtifact.project_id == project.id
-        ).all()
-
-        messages = db.query(ConversationMessage).filter(
-            ConversationMessage.project_id == project.id
-        ).order_by(
-            ConversationMessage.created_at.asc()
-        ).all()
-
-        return {
-            "project": {
-                "id": project.id,
-                "name": project.name,
-                "description": project.description,
-            },
-
-            "requirements": [
-                {
-                    "id": req.id,
-                    "requirement_code": req.requirement_code,
-                    "statement": req.statement,
-                    "category": req.category,
-                    "source_stakeholder": req.source_stakeholder,
-                    "business_justification": req.business_justification,
-                    "priority": req.priority,
-                    "dependencies": req.dependencies,
-                    "assumptions": req.assumptions,
-                    "acceptance_criteria": req.acceptance_criteria,
-                    "applicable_regulations": req.applicable_regulations,
-                    "risk_level": req.risk_level,
-                    "confidence_score": req.confidence_score,
-                    "approval_status": req.approval_status,
-                }
-                for req in requirements
-            ],
-
-            "quality_analysis": [
-                {
-                    "id": qa.id,
-                    "completeness_score": qa.completeness_score,
-                    "summary": qa.summary,
-                    "issues": qa.issues,
-                }
-                for qa in quality_analysis
-            ],
-
-            "compliance_findings": [
-                {
-                    "id": finding.id,
-                    "requirement_code": finding.requirement_code,
-                    "status": finding.status,
-                    "finding": finding.finding,
-                    "evidence": finding.evidence,
-                    "recommendation": finding.recommendation,
-                }
-                for finding in compliance_findings
-            ],
-
-            "risk_findings": [
-                {
-                    "id": finding.id,
-                    "requirement_code": finding.requirement_code,
-                    "risk_type": finding.risk_type,
-                    "severity": finding.severity,
-                    "description": finding.description,
-                    "mitigation": finding.mitigation,
-                }
-                for finding in risk_findings
-            ],
-
-            "sdlc_recommendations": [
-                {
-                    "id": recommendation.id,
-                    "regulatory_criticality": recommendation.regulatory_criticality,
-                    "change_frequency": recommendation.change_frequency,
-                    "risk_level": recommendation.risk_level,
-                    "complexity": recommendation.complexity,
-                    "delivery_priority": recommendation.delivery_priority,
-                    "requirements_clarity": recommendation.requirements_clarity,
-                    "recommended_model": recommendation.recommended_model,
-                    "reasoning": recommendation.reasoning,
-                    "key_factors": recommendation.key_factors,
-                }
-                for recommendation in sdlc_recommendations
-            ],
-
-            "documentation_artifacts": [
-                {
-                    "id": artifact.id,
-                    "artifact_type": artifact.artifact_type,
-                    "title": artifact.title,
-                    "content": artifact.content,
-                }
-                for artifact in documentation_artifacts
-            ],
-
-            "messages": [
-                {
-                    "role": message.role,
-                    "content": message.content,
-                }
-                for message in messages
-            ],
-        }
-
+            raise HTTPException(status_code=404, detail="Project not found")
+        return _serialize_project(db, project)
     finally:
         db.close()
