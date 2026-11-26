@@ -1,9 +1,13 @@
 import os
 import time
+import hashlib
+import hmac
+import secrets
+import models
 from typing import Literal
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai.errors import APIError, ServerError
@@ -21,9 +25,13 @@ from models import (
     AuditLog,
     ConversationMessage,
 )
-from database import SessionLocal
+from database import SessionLocal, engine
+from models import Base
+
+Base.metadata.create_all(bind=engine)
 
 load_dotenv()
+ACTIVE_SESSIONS: dict[str, int] = {}
 
 app = FastAPI()
 
@@ -85,6 +93,19 @@ def generate_structured(contents: str, schema):
 @app.get("/")
 def root():
     return {"message": "Backend connected successfully!", "model": os.getenv("GEMINI_MODEL") or MODEL_POOL}
+
+def _hash_password(password: str, salt: str | None = None) -> str:
+    salt = salt or secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100_000)
+    return f"{salt}${dk.hex()}"
+
+
+def _verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        salt, _ = stored_hash.split("$", 1)
+        return hmac.compare_digest(_hash_password(password, salt), stored_hash)
+    except ValueError:
+        return False
 
 
 class Requirement(BaseModel):
@@ -940,6 +961,99 @@ def get_db():
 
 class ProjectCreate(BaseModel):
     name: str | None = None
+
+class SignupRequest(BaseModel):
+    full_name: str
+    email: str
+    password: str
+    role: str = "Product Owner"
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+@app.post("/auth/signup")
+def signup(payload: SignupRequest):
+    from models import User
+
+    email = payload.email.strip().lower()
+    if not email or len(payload.password) < 6:
+        raise HTTPException(status_code=400, detail="Valid email and password (min 6 chars) required.")
+
+    db = SessionLocal()
+    try:
+        if db.query(User).filter(User.email == email).first():
+            raise HTTPException(status_code=400, detail="An account with this email already exists.")
+
+        user = User(
+            full_name=payload.full_name.strip() or email.split("@")[0],
+            email=email,
+            role=payload.role.strip() or "Product Owner",
+            password_hash=_hash_password(payload.password),
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+        token = secrets.token_urlsafe(32)
+        ACTIVE_SESSIONS[token] = user.id
+        return {
+            "token": token,
+            "user": {"id": user.id, "full_name": user.full_name, "email": user.email, "role": user.role},
+        }
+    finally:
+        db.close()
+
+
+@app.post("/auth/login")
+def login(payload: LoginRequest):
+    from models import User
+
+    email = payload.email.strip().lower()
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.email == email).first()
+        if not user or not _verify_password(payload.password, user.password_hash):
+            raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+        token = secrets.token_urlsafe(32)
+        ACTIVE_SESSIONS[token] = user.id
+        return {
+            "token": token,
+            "user": {"id": user.id, "full_name": user.full_name, "email": user.email, "role": user.role},
+        }
+    finally:
+        db.close()
+
+
+@app.get("/auth/me")
+def get_current_user(authorization: str | None = Header(default=None)):
+    from models import User
+
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    token = authorization.removeprefix("Bearer ").strip()
+    user_id = ACTIVE_SESSIONS.get(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Session expired")
+
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+        return {"id": user.id, "full_name": user.full_name, "email": user.email, "role": user.role}
+    finally:
+        db.close()
+
+
+@app.post("/auth/logout")
+def logout(authorization: str | None = Header(default=None)):
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.removeprefix("Bearer ").strip()
+        ACTIVE_SESSIONS.pop(token, None)
+    return {"status": "logged_out"}
 
 @app.post("/project/new")
 def create_new_project(

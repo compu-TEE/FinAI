@@ -1,6 +1,7 @@
 "use client";
 
 import { NavSection, ProjectSummary } from "../types";
+import { AuthUser } from "./AuthPage";
 
 type SidebarProps = {
   activeSection: NavSection;
@@ -10,6 +11,8 @@ type SidebarProps = {
   currentProjectName: string;
   onSelectProject: (projectId: number) => void;
   onNewProject: () => void;
+  user?: AuthUser | null;
+  onLogout?: () => void;
   counts: {
     requirements: number;
     issues: number;
@@ -27,6 +30,8 @@ export default function Sidebar({
   currentProjectName,
   onSelectProject,
   onNewProject,
+  user,
+  onLogout,
   counts,
 }: SidebarProps) {
   const navItems: { id: NavSection; label: string; badge?: string | number }[] = [
@@ -121,6 +126,25 @@ export default function Sidebar({
           );
         })}
       </nav>
+
+      {/* Signed-in User Footer */}
+      {user && onLogout && (
+        <div className="mt-4 border-t border-zinc-200 pt-4">
+          <div className="px-2">
+            <p className="truncate text-xs font-semibold text-zinc-900">
+              {user.full_name}
+            </p>
+            <p className="truncate text-[11px] text-zinc-500">{user.role}</p>
+          </div>
+          <button
+            type="button"
+            onClick={onLogout}
+            className="mt-2.5 w-full rounded-lg border border-zinc-200 px-3 py-1.5 text-left text-xs font-medium text-zinc-700 hover:bg-zinc-100"
+          >
+            Sign Out
+          </button>
+        </div>
+      )}
     </aside>
   );
 }

@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Sidebar from "./components/Sidebar";
 import DocumentationTabs from "./components/DocumentationTabs";
 import { API_BASE_URL } from "./lib/api";
+import AuthPage, { AuthUser } from "./components/AuthPage";
 import {
   ComplianceAnalysis,
   Message,
@@ -70,6 +71,10 @@ export default function Home() {
   const [documentationLoading, setDocumentationLoading] = useState(false);
   const [activeOperation, setActiveOperation] = useState<string | null>(null);
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
+
+  const [authToken, setAuthToken] = useState<string | null>(null);
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
 
   const hydrateProjectData = (data: any) => {
     if (data.project?.id) setCurrentProjectId(data.project.id);
@@ -628,11 +633,28 @@ const generateSDLCWorkflow = async () => {
 
   useEffect(() => {
     const init = async () => {
+      const savedToken = localStorage.getItem("finai_token");
+      if (savedToken) {
+        try {
+          const meRes = await fetch(`${API_BASE_URL}/auth/me`, {
+            headers: { Authorization: `Bearer ${savedToken}` },
+          });
+          if (meRes.ok) {
+            const user = await meRes.json();
+            setAuthToken(savedToken);
+            setCurrentUser(user);
+          } else {
+            localStorage.removeItem("finai_token");
+          }
+        } catch {
+          localStorage.removeItem("finai_token");
+        }
+      }
+      setAuthChecked(true);
+
       try {
         const res = await fetch(`${API_BASE_URL}/project`);
-        if (res.ok) {
-          hydrateProjectData(await res.json());
-        }
+        if (res.ok) hydrateProjectData(await res.json());
       } catch (error) {
         console.error("Failed to load saved project:", error);
       }
@@ -640,6 +662,30 @@ const generateSDLCWorkflow = async () => {
     };
     init();
   }, []);
+
+  const handleLogout = async () => {
+    if (authToken) {
+      await fetch(`${API_BASE_URL}/auth/logout`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${authToken}` },
+      }).catch(() => {});
+    }
+    localStorage.removeItem("finai_token");
+    setAuthToken(null);
+    setCurrentUser(null);
+  };
+
+  if (!authChecked) return null;
+  if (!authToken || !currentUser) {
+    return (
+      <AuthPage
+        onAuthenticated={(token, user) => {
+          setAuthToken(token);
+          setCurrentUser(user);
+        }}
+      />
+    );
+  }
 
   const approvedRequirements = requirements.filter(
     (r) => r.approval_status === "Approved"
@@ -783,22 +829,24 @@ const openNewProjectModal = () => {
           </form>
         </div>
       )}
-      <Sidebar
-  activeSection={activeSection}
-  onSelectSection={setActiveSection}
-  projects={projects}
-  currentProjectId={currentProjectId}
-  currentProjectName={currentProjectName}
-  onSelectProject={loadProjectById}
-  onNewProject={openNewProjectModal}
-  counts={{
-    requirements: requirements.length,
-    issues: qualityIssues,
-    compliance: complianceFindings,
-    risks: riskFindings,
-    hasDocs: Boolean(srsContent),
-  }}
-/>
+<Sidebar
+        activeSection={activeSection}
+        onSelectSection={setActiveSection}
+        projects={projects}
+        currentProjectId={currentProjectId}
+        currentProjectName={currentProjectName}
+        onSelectProject={loadProjectById}
+        onNewProject={openNewProjectModal}
+        user={currentUser}
+        onLogout={handleLogout}
+        counts={{
+          requirements: requirements.length,
+          issues: qualityIssues,
+          compliance: complianceFindings,
+          risks: riskFindings,
+          hasDocs: Boolean(srsContent),
+        }}
+      />
 
       <main className="flex-1 overflow-y-auto px-8 py-8">
         <div className="mx-auto max-w-5xl">
